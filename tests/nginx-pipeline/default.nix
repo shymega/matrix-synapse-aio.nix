@@ -1,13 +1,14 @@
-{ nixpkgs, lib, matrix-lib, writeText, ... }:
+{ nixpkgs, pkgs, lib, writeText, ... }:
 let
   nixosConfig = nixpkgs.lib.nixosSystem {
     system = "x86_64-linux";
     modules = [
-      ../../module.nix
+      ../../matrix-sliding-sync
+      ../../matrix-synapse
       {
         system.stateVersion = "23.11";
         boot.isContainer = true;
-        services.matrix-synapse-next = {
+        services.matrix-synapse = {
           enable = true;
           enableNginx = true;
 
@@ -28,7 +29,8 @@ let
                 ];
                 port = 1337;
                 resources = [
-                  { compress = false;
+                  {
+                    compress = false;
                     names = [ "federation" ];
                   }
                 ];
@@ -42,12 +44,12 @@ let
     ];
   };
 
-  inherit (nixosConfig.config.services.matrix-synapse-next.workers) instances;
+  inherit (nixosConfig.config.services.matrix-synapse.workers) instances;
 in
-  writeText "matrix-synapse-next-nginx-pipeline-test.txt" ''
-    ${(lib.generators.toPretty {}) instances}
+writeText "matrix-synapse-next-nginx-pipeline-test.txt" ''
+  ${(lib.generators.toPretty {}) instances}
 
-    ====================================================
+  ====================================================
 
-    ${(lib.generators.toPretty {}) (matrix-lib.mapWorkersToUpstreamsByType instances)}
-  ''
+  ${(lib.generators.toPretty {}) (lib.matrix-lib.mapWorkersToUpstreamsByType instances)}
+''

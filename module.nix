@@ -1,8 +1,8 @@
-{ ... }:
+{ pkgs, lib, ... }:
 
 {
   imports = [
-    ./synapse-module
-    ./sliding-sync
+    ./matrix-synapse
+    ./matrix-sliding-sync
   ];
 }

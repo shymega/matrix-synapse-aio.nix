@@ -1,12 +1,11 @@
 { config, lib, pkgs, ... }:
-
 let
-  cfg = config.services.matrix-synapse.sliding-sync;
+  cfg = config.services.matrix-sliding-sync;
 in
 {
   disabledModules = [ "services/matrix/matrix-sliding-sync.nix" ];
 
-  options.services.matrix-synapse.sliding-sync = {
+  options.services.matrix-sliding-sync = {
     enable = lib.mkEnableOption (lib.mdDoc "sliding sync");
 
     package = lib.mkOption {
@@ -19,6 +18,7 @@ in
     publicBaseUrl = lib.mkOption {
       type = lib.types.str;
       description = "The domain where clients connect, only has an effect with enableNginx";
+      default = config.services.matrix-synapse.settings.public_baseurl;
       example = "slidingsync.matrix.org";
     };
 
@@ -31,6 +31,7 @@ in
             description = lib.mdDoc ''
               The destination homeserver to talk to not including `/_matrix/` e.g `https://matrix.example.org`.
             '';
+            default = config.services.matrix-synapse.settings.public_baseurl;
           };
 
           SYNCV3_DB = lib.mkOption {
@@ -87,10 +88,10 @@ in
     services.postgresql = lib.optionalAttrs cfg.createDatabase {
       enable = true;
       ensureDatabases = [ "matrix-sliding-sync" ];
-      ensureUsers = [ rec {
+      ensureUsers = [{
         name = "matrix-sliding-sync";
         ensureDBOwnership = true;
-      } ];
+      }];
     };
 
     systemd.services.matrix-sliding-sync = {
@@ -107,10 +108,17 @@ in
     };
 
     services.nginx.virtualHosts.${cfg.publicBaseUrl} = lib.mkIf cfg.enableNginx {
-      enableACME = lib.mkDefault true;
+      enableACME = true;
       forceSSL = true;
-      locations."/" = {
-        proxyPass = lib.replaceStrings [ "0.0.0.0" "::" ] [ "127.0.0.1" "::1" ] "http://${cfg.settings.SYNCV3_BINDADDR}";
+      locations."~ ^/(client/|_matrix/client/unstable/org.matrix.msc3575/sync)" = {
+         proxyPass =  "http://127.0.0.1:8009";
+         extraConfig = ''
+              proxy_set_header X-Forwarded-For $remote_addr;
+              proxy_set_header X-Forwarded-Proto $scheme;
+              proxy_set_header Host $host;
+              proxy_http_version 1.1;
+              proxy_read_timeout 10m;
+         '';
       };
     };
   };

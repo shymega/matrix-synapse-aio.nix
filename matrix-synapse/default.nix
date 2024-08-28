@@ -1,62 +1,115 @@
-{ pkgs, lib, config, ... }:
-let 
+{ pkgs, lib, matrix-lib, config, ... }:
+with lib;
+let
   matrix-lib = (import ../lib.nix { inherit lib; });
 
-  cfg = config.services.matrix-synapse-next;
+  cfg = config.services.matrix-synapse;
   wcfg = cfg.workers;
+  format = pkgs.formats.yaml { };
+
+  filterRecursiveNull = o:
+    if isAttrs o then
+      mapAttrs (_: v: filterRecursiveNull v) (filterAttrs (_: v: v != null) o)
+    else if isList o then
+      map filterRecursiveNull (filter (v: v != null) o)
+    else
+      o;
+
+  # remove null values from the final configuration
+  finalSettings = filterRecursiveNull cfg.settings;
+  configFile = format.generate "homeserver.yaml" finalSettings;
 
   # Used to generate proper defaultTexts.
-  cfgText = "config.services.matrix-synapse-next";
-  wcfgText = "config.services.matrix-synapse-next.workers";
+  cfgText = "config.services.matrix-synapse";
+  wcfgText = "config.services.matrix-synapse.workers";
 
-  format = pkgs.formats.yaml {};
   matrix-synapse-common-config = format.generate "matrix-synapse-common-config.yaml" (cfg.settings // {
     listeners = map (lib.filterAttrsRecursive (_: v: v != null)) cfg.settings.listeners;
   });
 
-  # TODO: Align better with the upstream module
-  wrapped = cfg.package.override { 
+
+  usePostgresql = cfg.settings.database.name == "psycopg2";
+  hasLocalPostgresDB = let args = cfg.settings.database.args; in
+    usePostgresql
+    && (!(args ? host) || (elem args.host [ "localhost" "127.0.0.1" "::1" ]))
+    && config.services.postgresql.enable;
+  hasWorkers = cfg.workers != { };
+
+  defaultExtras = [
+    "systemd"
+    "postgres"
+    "url-preview"
+    "redis"
+    "user-search"
+  ];
+
+  wrapped = pkgs.matrix-synapse.override {
+    extras = defaultExtras;
     inherit (cfg) plugins;
-    extras = [
-      "postgres"
-      "saml2"
-      "oidc"
-      "systemd"
-      "url-preview"
-      "sentry"
-      "jwt"
-      "redis"
-      "cache-memory"
-      "user-search"
-    ];
   };
 
-  inherit (lib)
-    literalExpression
-    mkEnableOption
-    mkIf
-    mkMerge
-    mkOption
-    mkPackageOption
-    types;
+  defaultCommonLogConfig = {
+    version = 1;
+    formatters.journal_fmt.format = "%(name)s: [%(request)s] %(message)s";
+    handlers.journal = {
+      class = "systemd.journal.JournalHandler";
+      formatter = "journal_fmt";
+    };
+    root = {
+      level = "DEBUG";
+      handlers = [ "journal" ];
+    };
+    disable_existing_loggers = false;
+  };
 
-  throw' = str: throw ''
-    matrix-synapse-next error:
-    ${str}
-  '';
+  defaultCommonLogConfigText = generators.toPretty { } defaultCommonLogConfig;
+
+  logConfigText = logName:
+    lib.literalMD ''
+      Path to a yaml file generated from this Nix expression:
+
+      ```
+      ${generators.toPretty { } (
+        recursiveUpdate defaultCommonLogConfig { handlers.journal.SYSLOG_IDENTIFIER = logName; }
+      )}
+      ```
+    '';
+
+  genLogConfigFile = logName: format.generate
+    "synapse-log-${logName}.yaml"
+    (cfg.log // optionalAttrs (cfg.log?handlers.journal) {
+      handlers.journal = cfg.log.handlers.journal // {
+        SYSLOG_IDENTIFIER = logName;
+      };
+    });
+
+  toIntBase8 = str:
+    lib.pipe str [
+      lib.stringToCharacters
+      (map lib.toInt)
+      (lib.foldl (acc: digit: acc * 8 + digit) 0)
+    ];
+
+  toDecimalFilePermission = value:
+    if value == null then
+      null
+    else
+      toIntBase8 value;
 in
 {
+  disabledModules = [ "services/matrix/synapse.nix" ];
+
   imports = [
     ./nginx.nix
     (import ./workers.nix {
-      inherit matrix-lib throw' format matrix-synapse-common-config wrapped;
+      inherit throw' matrix-synapse-common-config wrapped format matrix-lib;
     })
   ];
 
-  options.services.matrix-synapse-next = {
+  options.services.matrix-synapse = {
     enable = mkEnableOption "matrix-synapse";
 
-    package = mkPackageOption pkgs "matrix-synapse" {};
+    package = mkPackageOption pkgs "matrix-synapse" { };
 
     plugins = mkOption {
       type = types.listOf types.package;
@@ -90,13 +143,76 @@ in
       '';
     };
 
+    serviceUnit = lib.mkOption {
+      type = lib.types.str;
+      readOnly = true;
+      description = ''
+        The systemd unit (a service or a target) for other services to depend on if they
+        need to be started after matrix-synapse.
+
+        This option is useful as the actual parent unit for all matrix-synapse processes
+        changes when configuring workers.
+      '';
+    };
+
+
+    configFile = mkOption {
+      type = types.path;
+      readOnly = true;
+      description = ''
+        Path to the configuration file on the target system. Useful to configure e.g. workers
+        that also need this.
+      '';
+    };
+
+    log = mkOption {
+      type = types.attrsOf format.type;
+      defaultText = literalExpression defaultCommonLogConfigText;
+      description = ''
+        Default configuration for the loggers used by `matrix-synapse` and its workers.
+        The defaults are added with the default priority which means that
+        these will be merged with additional declarations. These additional
+        declarations also take precedence over the defaults when declared
+        with at least normal priority. For instance
+        the log-level for synapse and its workers can be changed like this:
+
+        ```nix
+        { lib, ... }: {
+          services.matrix-synapse.log.root.level = "WARNING";
+        }
+        ```
+
+        And another field can be added like this:
+
+        ```nix
+        {
+          services.matrix-synapse.log = {
+            loggers."synapse.http.matrixfederationclient".level = "DEBUG";
+          };
+        }
+        ```
+
+        Additionally, the field `handlers.journal.SYSLOG_IDENTIFIER` will be added to
+        each log config, i.e.
+        * `synapse` for `matrix-synapse.service`
+        * `synapse-<worker name>` for `matrix-synapse-worker-<worker name>.service`
+
+        This is only done if this option has a `handlers.journal` field declared.
+
+        To discard all settings declared by this option for each worker and synapse,
+        `lib.mkForce` can be used.
+
+        To discard all settings declared by this option for a single worker or synapse only,
+        [](#opt-services.matrix-synapse.workers._name_.worker_log_config) or
+        [](#opt-services.matrix-synapse.settings.log_config) can be used.
+      '';
+    };
+
     enableNginx = mkEnableOption "The synapse module managing nginx";
 
     public_baseurl = mkOption {
       type = types.str;
-      default = "matrix.${cfg.settings.server_name}";
-      defaultText =
-        literalExpression ''matrix.''${${cfgText}.settings.server_name}'';
+      default = "${cfg.settings.server_name}";
       description = ''
         The domain where clients and such will connect.
         This may be different from server_name if using delegation.
@@ -135,6 +251,16 @@ in
             '';
             example = "matrix.org";
           };
+
+          public_baseurl = mkOption {
+            type = types.str;
+            default = "${cfg.settings.server_name}";
+            description = ''
+              The domain where clients and such will connect.
+              This may be different from server_name if using delegation.
+            '';
+          };
+
 
           use_presence = mkOption {
             type = types.bool;
@@ -249,14 +375,14 @@ in
               (mkIf (wcfg.instances != { }) {
                 path = "${cfg.socketDir}/matrix-synapse-replication.sock";
                 resources = [
-                  {  names = [ "replication" ]; }
+                  { names = [ "replication" ]; }
                 ];
               })
               (mkIf cfg.settings.enable_metrics {
                 port = 9000;
                 bind_addresses = [ "127.0.0.1" ];
                 resources = [
-                  {  names = [ "metrics" ]; }
+                  { names = [ "metrics" ]; }
                 ];
               })
             ];
@@ -313,7 +439,7 @@ in
           app_service_config_files = mkOption {
             type = types.listOf types.path;
             description = "A list of application service config files to use";
-            default = [];
+            default = [ ];
           };
 
           signing_key_path = mkOption {
@@ -377,7 +503,7 @@ in
 
     extraConfigFiles = mkOption {
       type = types.listOf types.path;
-      default = [];
+      default = [ ];
       description = ''
         Extra config files to include.
         The configuration files will be included based on the command line
@@ -389,11 +515,12 @@ in
   };
 
   config = mkIf cfg.enable {
-    assertions = [ ]
-      ++ (map (l: {
+    assertions = map
+      (l: {
         assertion = l.path == null -> (l.bind_addresses != [ ] && l.port != null);
         message = "Some listeners are missing either a socket path or a bind_address + port to listen on";
-      }) cfg.settings.listeners);
+      })
+      cfg.settings.listeners;
 
     users.users.matrix-synapse = {
       group = "matrix-synapse";
@@ -407,6 +534,13 @@ in
       gid = config.ids.gids.matrix-synapse;
     };
 
+
+    services.matrix-synapse.serviceUnit = if hasWorkers then "matrix-synapse.target" else "matrix-synapse.service";
+    services.matrix-synapse.configFile = configFile;
+    services.matrix-synapse.package = wrapped;
+
+    services.matrix-synapse.log = mapAttrsRecursive (const mkDefault) defaultCommonLogConfig;
+
     systemd = {
       targets.matrix-synapse = {
         description = "Matrix synapse parent target";
@@ -416,8 +550,8 @@ in
 
       slices.system-matrix-synapse = {
         description = "Matrix synapse slice";
-        requires= [ "system.slice" ];
-        after= [ "system.slice" ];
+        requires = [ "system.slice" ];
+        after = [ "system.slice" ];
       };
 
       services.matrix-synapse = {
@@ -425,13 +559,15 @@ in
         partOf = [ "matrix-synapse.target" ];
         wantedBy = [ "matrix-synapse.target" ];
 
-        preStart = let
-          flags = lib.cli.toGNUCommandLineShell {} {
-            config-path = [ matrix-synapse-common-config ] ++ cfg.extraConfigFiles;
-            keys-directory = cfg.dataDir;
-            generate-keys = true;
-          };
-        in "${cfg.package}/bin/synapse_homeserver ${flags}";
+        preStart =
+          let
+            flags = lib.cli.toGNUCommandLineShell { } {
+              config-path = [ matrix-synapse-common-config ] ++ cfg.extraConfigFiles;
+              keys-directory = cfg.dataDir;
+              generate-keys = true;
+            };
+          in
+          "${cfg.package}/bin/synapse_homeserver ${flags}";
 
         serviceConfig = {
           Type = "notify";
@@ -441,22 +577,23 @@ in
           WorkingDirectory = cfg.dataDir;
           StateDirectory = "matrix-synapse";
           RuntimeDirectory = "matrix-synapse";
-          ExecStart = let
-            flags = lib.cli.toGNUCommandLineShell {} {
-              config-path = [ matrix-synapse-common-config ] ++ cfg.extraConfigFiles;
-              keys-directory = cfg.dataDir;
-            };
-          in "${wrapped}/bin/synapse_homeserver ${flags}";
+          ExecStart =
+            let
+              flags = lib.cli.toGNUCommandLineShell { } {
+                config-path = [ matrix-synapse-common-config ] ++ cfg.extraConfigFiles;
+                keys-directory = cfg.dataDir;
+              };
+            in
+            "${wrapped}/bin/synapse_homeserver ${flags}";
           ExecReload = "${pkgs.utillinux}/bin/kill -HUP $MAINPID";
           Restart = "on-failure";
         };
       };
     };
-
-    services.matrix-synapse-next.settings.extra_well_known_client_content."org.matrix.msc3575.proxy" = mkIf cfg.enableSlidingSync {
-      url = "https://${config.services.matrix-synapse.sliding-sync.publicBaseUrl}";
+    services.matrix-synapse.settings.extra_well_known_client_content."org.matrix.msc3575.proxy" = mkIf cfg.enableSlidingSync {
+      url = "https://${config.services.matrix-sliding-sync.publicBaseUrl}";
     };
-    services.matrix-synapse.sliding-sync = mkIf cfg.enableSlidingSync {
+    services.matrix-sliding-sync = mkIf cfg.enableSlidingSync {
       enable = true;
       enableNginx = lib.mkDefault cfg.enableNginx;
       publicBaseUrl = lib.mkDefault "slidingsync.${cfg.settings.server_name}";

@@ -1,4 +1,4 @@
-{ nixpkgs, pkgs, matrix-lib, ... }:
+{ nixpkgs, pkgs, lib, ... }:
 {
-  nginx-pipeline = pkgs.callPackage ./nginx-pipeline { inherit nixpkgs matrix-lib; };
+  nginx-pipeline = pkgs.callPackage ./nginx-pipeline { inherit nixpkgs pkgs lib; };
 }
